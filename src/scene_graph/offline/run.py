@@ -63,7 +63,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--source",
-        choices=("sens", "rosbag", "npz", "frames-json"),
+        choices=("sens", "rosbag", "npz", "frames-json", "stream"),
         required=True,
         help="Frame source type.",
     )
@@ -143,6 +143,25 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=float,
         default=10.0,
         help="(frames-json) nominal Hz used to synthesise stamp_ns when timestamp_ns is missing.",
+    )
+
+    parser.add_argument(
+        "--stream-port",
+        type=int,
+        default=5555,
+        help="(stream) TCP port to listen on for a live frame publisher.",
+    )
+    parser.add_argument(
+        "--stream-bind",
+        type=str,
+        default="127.0.0.1",
+        help="(stream) interface to bind the frame listener on.",
+    )
+    parser.add_argument(
+        "--stream-accept-timeout-s",
+        type=float,
+        default=600.0,
+        help="(stream) seconds to wait for the publisher to connect.",
     )
 
     # Driver/shared
@@ -511,6 +530,14 @@ def make_frame_source(args: argparse.Namespace):
             end=None if args.end < 0 else args.end,
             nominal_hz=args.frames_json_nominal_hz,
             depth_clip_m=args.frames_json_depth_clip_m,
+        )
+    if args.source == "stream":
+        from scene_graph.offline.frame_sources.stream import StreamFrameSource
+
+        return StreamFrameSource(
+            port=args.stream_port,
+            bind=args.stream_bind,
+            accept_timeout_s=args.stream_accept_timeout_s,
         )
     raise SystemExit(f"Unknown source: {args.source}")
 
