@@ -87,28 +87,18 @@ class FrontierOverlay:
 
         if not self._mesh_added and payload.get("mesh") is not None:
             m = payload["mesh"]
-            verts = np.asarray(m["vertices"], dtype=np.float32)
-            # Palette-posterized dollhouse: one single-color sub-mesh per
-            # palette entry (raw mesh path = no axis conversion). side="front"
-            # culls ceiling/outer walls exactly like habitat's own renders,
-            # so the interior is always visible from above.
-            for i, part in enumerate(m["parts"]):
-                faces = np.asarray(part["faces"], dtype=np.uint32)
-                if len(faces) == 0:
-                    continue
-                scene.add_mesh_simple(
-                    f"{_ROOT}/mesh/{i}",
-                    vertices=verts,
-                    faces=faces,
-                    color=tuple(int(c) for c in part["color"]),
-                    flat_shading=False,
-                    side="front",
-                    cast_shadow=False,
-                )
+            # Real textured GLB, pre-dimmed + unlit ("unknown" brightness).
+            # viser's glb path applies no axis conversion; the wxyz node
+            # rotation places the file-frame mesh into the stream world frame.
+            scene.add_glb(
+                f"{_ROOT}/mesh",
+                glb_data=m["glb"],
+                wxyz=tuple(float(v) for v in m["wxyz"]),
+                cast_shadow=False,
+            )
             self._mesh_added = True
             LOGGER.info(
-                "frontier overlay: dollhouse mesh added (%d verts, %d color parts)",
-                len(verts), len(m["parts"]),
+                "frontier overlay: dimmed textured mesh added (%d bytes)", len(m["glb"])
             )
 
         occ = payload.get("occ_pts")
@@ -117,10 +107,10 @@ class FrontierOverlay:
             colors = payload.get("occ_colors")
             if colors is None:
                 colors = np.full((len(pts), 3), (200, 200, 200), dtype=np.uint8)
-            # seen = lighter: push the true texture colors toward white
-            colors = (255 - (255 - np.asarray(colors, dtype=np.float32)) * 0.45).astype(np.uint8)
+            # seen = a little lighter than unknown: full-brightness texture
+            # colors over the dimmed base mesh.
             scene.add_point_cloud(
-                f"{_ROOT}/explored", points=pts, colors=colors,
+                f"{_ROOT}/explored", points=pts, colors=np.asarray(colors, dtype=np.uint8),
                 point_size=0.07, point_shape="circle",
             )
 
