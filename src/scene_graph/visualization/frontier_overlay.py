@@ -41,6 +41,7 @@ class FrontierOverlay:
         self._server = None
         self._mesh_added = False
         self._up_set = False
+        self._gui_added = False
         self._trail: list = []
         self._frontier_handles: dict = {}
         self._goal_handle = None
@@ -84,6 +85,25 @@ class FrontierOverlay:
             except Exception:
                 pass
             self._up_set = True
+
+        # Dock the live exploration viewer page inside viser's own sidebar.
+        viewer_port = payload.get("viewer_port")
+        if not self._gui_added and viewer_port:
+            try:
+                with server.gui.add_folder("Frontier exploration"):
+                    server.gui.add_html(
+                        f'<iframe src="http://localhost:{int(viewer_port)}/" '
+                        'style="width:100%;height:460px;border:0;border-radius:4px;background:#111">'
+                        "</iframe>"
+                        f'<a href="http://localhost:{int(viewer_port)}/" target="_blank" '
+                        'style="color:#8ab4ff;font-size:12px">open full size</a>'
+                    )
+                self._gui_added = True
+                LOGGER.info("frontier overlay: exploration viewer docked in sidebar (:%d)", viewer_port)
+            except Exception as exc:
+                if not self._warned:
+                    LOGGER.warning("could not dock exploration viewer: %s", exc)
+                    self._warned = True
 
         if not self._mesh_added and payload.get("mesh") is not None:
             m = payload["mesh"]
