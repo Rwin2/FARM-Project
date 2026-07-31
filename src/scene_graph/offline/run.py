@@ -594,7 +594,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         frame_count = 0
         n_dropped = 0
 
-        src_iter = iter(source)
+        from scene_graph.visualization.frontier_overlay import wrap_frame_iterator
+
+        src_iter = wrap_frame_iterator(
+            iter(source), lambda: getattr(mapper, "_viser_visualizer", None)
+        )
         # Warm-up phase: process N frames before the wall-clock timer starts so
         # one-time costs (YOLOE compile, CUDA warmup, first vLLM tunnel round-
         # trip, SigLIP2 first inference) don't blow the deadline budget and
