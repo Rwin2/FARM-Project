@@ -10,9 +10,13 @@ one interactive sidebar, and one coordinate frame (identical orientation,
 constant translation).
 
 Payload schema (all poses 4x4 row-major lists, OpenCV cam-to-world, stream
-world frame):
+world frame; all geometry in the SAME stream world frame — no glTF axis
+conversion anywhere, so the overlay stays aligned with the scene graph):
     offset:    [dx, dy, dz] translation of the overlay root (sent every time)
-    glb_bytes: scene mesh as GLB bytes (sent once, first frame)
+    mesh:      {"vertices": Nx3 f32, "faces": Mx3 u32} GT mesh, sent once,
+               drawn dark = the *unknown* scene (FrontierNet convention)
+    occ_pts:   Kx3 f32 observed occupied voxel centers, periodic — drawn as
+               bright points so the *explored* part lights up
     agent:     current camera pose
     trail_pt:  [x, y, z] append-only agent trail point (optional)
     frontiers: [{"T": pose, "gain": float}, ...] current valid frontiers
@@ -35,7 +39,8 @@ _ROOT = "/frontier_view"
 class FrontierOverlay:
     def __init__(self) -> None:
         self._server = None
-        self._glb_added = False
+        self._mesh_added = False
+        self._up_set = False
         self._trail: list = []
         self._frontier_handles: dict = {}
         self._goal_handle = None
@@ -70,10 +75,44 @@ class FrontierOverlay:
 
         scene.add_frame(_ROOT, position=offset, show_axes=False)
 
-        if not self._glb_added and payload.get("glb_bytes"):
-            scene.add_glb(f"{_ROOT}/mesh", glb_data=payload["glb_bytes"], cast_shadow=False)
-            self._glb_added = True
-            LOGGER.info("frontier overlay: scene mesh added (%d bytes)", len(payload["glb_bytes"]))
+        if not self._up_set:
+            # Stream data (habitat) is Y-up; make the whole viewer agree so
+            # both the scene graph and this overlay stand upright.
+            try:
+                scene.set_up_direction("+y")
+            except Exception:
+                pass
+            self._up_set = True
+
+        if not self._mesh_added and payload.get("mesh") is not None:
+            m = payload["mesh"]
+            scene.add_mesh_simple(
+                f"{_ROOT}/mesh",
+                vertices=np.asarray(m["vertices"], dtype=np.float32),
+                faces=np.asarray(m["faces"], dtype=np.uint32),
+                color=(74, 74, 80),  # dark = unknown (FrontierNet style)
+                flat_shading=False,
+                side="double",
+            )
+            self._mesh_added = True
+            LOGGER.info(
+                "frontier overlay: scene mesh added (%d verts, stream frame)",
+                len(m["vertices"]),
+            )
+
+        occ = payload.get("occ_pts")
+        if occ is not None and len(occ):
+            pts = np.asarray(occ, dtype=np.float32)
+            y = pts[:, 1]
+            t = (y - y.min()) / max(float(y.max() - y.min()), 1e-6)
+            # explored voxels glow: orange floor -> pale-yellow ceiling
+            colors = np.stack(
+                [230 + 25 * t, 150 + 90 * t, 60 + 110 * t], axis=1
+            ).astype(np.uint8)
+            scene.add_point_cloud(
+                f"{_ROOT}/explored", points=pts, colors=colors,
+                point_size=0.055, point_shape="circle",
+            )
 
         fov = float(payload.get("fov", 1.2))
         aspect = float(payload.get("aspect", 4.0 / 3.0))
