@@ -44,6 +44,7 @@ class FrontierOverlay:
         self._trail: list = []
         self._frontier_handles: dict = {}
         self._goal_handle = None
+        self._rays_handle = None
         self._warned = False
 
     def _wxyz_pos(self, T: np.ndarray):
@@ -53,9 +54,9 @@ class FrontierOverlay:
 
     @staticmethod
     def _gain_color(gain: float, max_gain: float):
-        """Low gain -> dark red, high gain -> yellow (FrontierNet's convention)."""
+        """FrontierNet gif convention: high gain -> orange, low gain -> yellow."""
         t = float(np.clip(gain / max(max_gain, 1e-6), 0.0, 1.0))
-        return (int(120 + 135 * t), int(200 * t), 30)
+        return (255, int(225 - 120 * t), int(90 - 75 * t))
 
     def handle(self, payload: dict, visualizer) -> None:
         try:
@@ -90,7 +91,7 @@ class FrontierOverlay:
                 f"{_ROOT}/mesh",
                 vertices=np.asarray(m["vertices"], dtype=np.float32),
                 faces=np.asarray(m["faces"], dtype=np.uint32),
-                color=(74, 74, 80),  # dark = unknown (FrontierNet style)
+                color=(38, 38, 42),  # near-black = unknown (gif style)
                 flat_shading=False,
                 side="double",
             )
@@ -103,15 +104,12 @@ class FrontierOverlay:
         occ = payload.get("occ_pts")
         if occ is not None and len(occ):
             pts = np.asarray(occ, dtype=np.float32)
-            y = pts[:, 1]
-            t = (y - y.min()) / max(float(y.max() - y.min()), 1e-6)
-            # explored voxels glow: orange floor -> pale-yellow ceiling
-            colors = np.stack(
-                [230 + 25 * t, 150 + 90 * t, 60 + 110 * t], axis=1
-            ).astype(np.uint8)
+            colors = payload.get("occ_colors")
+            if colors is None:
+                colors = np.full((len(pts), 3), (255, 200, 120), dtype=np.uint8)
             scene.add_point_cloud(
-                f"{_ROOT}/explored", points=pts, colors=colors,
-                point_size=0.055, point_shape="circle",
+                f"{_ROOT}/explored", points=pts, colors=np.asarray(colors, dtype=np.uint8),
+                point_size=0.07, point_shape="circle",
             )
 
         fov = float(payload.get("fov", 1.2))
@@ -131,14 +129,20 @@ class FrontierOverlay:
             if len(self._trail) >= 2:
                 pts = np.asarray(self._trail, dtype=np.float32)
                 segs = np.stack([pts[:-1], pts[1:]], axis=1)
+                # time-gradient trajectory (gif style): purple -> green
+                t = np.linspace(0.0, 1.0, len(segs))[:, None]
+                seg_col = ((1 - t) * np.array([150, 30, 200]) + t * np.array([40, 220, 120])).astype(np.uint8)
                 scene.add_line_segments(
-                    f"{_ROOT}/trail", points=segs, colors=(30, 100, 255), line_width=3.0,
+                    f"{_ROOT}/trail", points=segs,
+                    colors=np.repeat(seg_col[:, None, :], 2, axis=1), line_width=4.0,
                 )
 
         frontiers = payload.get("frontiers")
+        agent_pos = None if payload.get("agent") is None else np.asarray(payload["agent"])[:3, 3]
         if frontiers is not None:
             max_gain = max([f["gain"] for f in frontiers], default=1.0)
             seen = set()
+            ray_pts = []
             for i, f in enumerate(frontiers):
                 name = f"{_ROOT}/ft/{i}"
                 seen.add(name)
@@ -147,18 +151,33 @@ class FrontierOverlay:
                     name, fov=fov, aspect=aspect, scale=0.25, line_width=2.0,
                     color=self._gain_color(f["gain"], max_gain), wxyz=wxyz, position=pos,
                 )
+                if agent_pos is not None:
+                    ray_pts.append([agent_pos, pos])
             for name in list(self._frontier_handles):
                 if name not in seen:
                     try:
                         self._frontier_handles.pop(name).remove()
                     except Exception:
                         pass
+            # thin light rays agent -> frontiers (the gif's graph edges)
+            if ray_pts:
+                self._rays_handle = scene.add_line_segments(
+                    f"{_ROOT}/rays", points=np.asarray(ray_pts, dtype=np.float32),
+                    colors=(225, 225, 225), line_width=1.0,
+                )
+            elif self._rays_handle is not None:
+                try:
+                    self._rays_handle.remove()
+                except Exception:
+                    pass
 
         goal = payload.get("goal")
         if goal is not None:
-            _, pos = self._wxyz_pos(goal)
-            self._goal_handle = scene.add_icosphere(
-                f"{_ROOT}/goal", radius=0.16, color=(20, 60, 255), position=pos,
+            # next-goal frontier: enlarged frustum (gif convention)
+            wxyz, pos = self._wxyz_pos(goal)
+            self._goal_handle = scene.add_camera_frustum(
+                f"{_ROOT}/goal", fov=fov, aspect=aspect, scale=0.55,
+                line_width=3.5, color=(255, 70, 0), wxyz=wxyz, position=pos,
             )
         elif self._goal_handle is not None:
             try:
