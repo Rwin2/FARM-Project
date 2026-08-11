@@ -596,8 +596,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         from scene_graph.visualization.frontier_overlay import wrap_frame_iterator
 
+        save_path_q = args.save_path.expanduser() if args.save_path else None
         src_iter = wrap_frame_iterator(
-            iter(source), lambda: getattr(mapper, "_viser_visualizer", None)
+            iter(source), lambda: getattr(mapper, "_viser_visualizer", None),
+            query_sink_path=(str(save_path_q.with_name(save_path_q.stem + "_query.json"))
+                             if save_path_q is not None else None),
         )
         # Warm-up phase: process N frames before the wall-clock timer starts so
         # one-time costs (YOLOE compile, CUDA warmup, first vLLM tunnel round-

@@ -445,7 +445,10 @@ class _Siglip2TextEmbedWrapper:
             text_inputs = processor(
                 text=text_list,
                 return_tensors="pt",
-                padding=True,
+                # SigLIP text towers are trained with fixed 64-token padding;
+                # dynamic padding silently produces garbage embeddings.
+                padding="max_length",
+                max_length=64,
                 truncation=True,
             )
             inputs: Dict[str, Any] = {}
