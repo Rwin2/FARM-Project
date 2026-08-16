@@ -30,8 +30,32 @@ class FrontierOverlay:
         self._warned = False
         self._query_sink_path = query_sink_path
         self._query_hooked = False
+        self._match_folder = None
+        # Full-frame JPEG cache, index-aligned with the mapper's image ids
+        # (~25 KB per 320x320 frame; capped). Lets a query candidate resolve
+        # its best-view FULL image, not just the object crop.
+        self._frame_jpegs: list = []
+        self._frame_cache_cap = 4000
+        self._suppress_mirror = False
         self._graph_port = int(graph_port)
         self._graph_server_started = False
+
+    def cache_frame(self, rgb) -> None:
+        try:
+            if len(self._frame_jpegs) >= self._frame_cache_cap:
+                return
+            import io
+
+            import numpy as np
+            from PIL import Image
+
+            buf = io.BytesIO()
+            Image.fromarray(np.ascontiguousarray(
+                np.asarray(rgb)[..., :3]).astype(np.uint8)).save(
+                buf, format="JPEG", quality=88)
+            self._frame_jpegs.append(buf.getvalue())
+        except Exception:
+            self._frame_jpegs.append(b"")
 
     # Scene-state keys the explorer's graph client consumes (see FARM-Frontier
     # farm_frontier/reasoning/graph_client.py). Everything else stays private.
@@ -50,6 +74,8 @@ class FrontierOverlay:
         import http.server
         import threading
 
+        overlay_self = self
+
         def _tolist(v):
             if hasattr(v, "detach"):
                 v = v.detach().cpu()
@@ -64,6 +90,20 @@ class FrontierOverlay:
                 pass
 
             def do_GET(self):
+                if self.path.startswith("/refresh"):
+                    # Re-run the last panel query (results list, match
+                    # buttons, highlight) WITHOUT re-triggering a search.
+                    try:
+                        overlay_self._suppress_mirror = True
+                        visualizer._handle_query_clicked()
+                        body = b"ok"
+                    except Exception as exc:
+                        body = f"refresh failed: {exc}".encode()
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 if not self.path.startswith("/graph.json"):
                     self.send_error(404)
                     return
@@ -148,7 +188,113 @@ class FrontierOverlay:
         def run_wrapped(query: str):
             out = orig_run(query)
             try:
-                last["query"], last["n_results"] = query, len(out[0] or [])
+                import numpy as np
+
+                results = out[0] or []
+                last["query"], last["n_results"] = query, len(results)
+                # Serialize the panel's own ranked candidates (object_id,
+                # composite score, caption) plus their 3D positions, so the
+                # explorer can verify them (SAM3 + VLM) and navigate. Note the
+                # composite score is RELATIVE (sem /= sem.max(): top ~ 1.0).
+                state = getattr(visualizer, "_latest_scene_state", None) or {}
+                means = np.asarray(state.get("means", np.zeros((0, 3))),
+                                   dtype=float).reshape(-1, 3)
+                ids = [int(v) for v in np.asarray(
+                    state.get("object_id", np.arange(len(means)))).reshape(-1)]
+                rgb_obs = state.get("rgb_observations") or []
+                vp_ids = state.get("viewpoint_image_ids") or []
+                img_pos = state.get("image_positions")
+
+                def _to_np(v):
+                    return v.detach().cpu().numpy() if hasattr(v, "detach") else np.asarray(v)
+
+                def _best_crop_b64(idx):
+                    """The same stored crop the panel shows on click: largest
+                    'image' entry of the object's rgb_observations row."""
+                    row = rgb_obs[idx] if idx < len(rgb_obs) else None
+                    if not isinstance(row, list) or not row:
+                        return None
+                    best, best_a = None, -1
+                    for e in row:
+                        img = e.get("image") if isinstance(e, dict) else None
+                        if img is None:
+                            continue
+                        img = _to_np(img)
+                        a = int(img.shape[0]) * int(img.shape[1])
+                        if a > best_a:
+                            best, best_a = img, a
+                    if best is None:
+                        return None
+                    import base64
+                    import io
+
+                    from PIL import Image
+
+                    buf = io.BytesIO()
+                    Image.fromarray(np.ascontiguousarray(best[..., :3]).astype(np.uint8)).save(
+                        buf, format="JPEG", quality=88)
+                    return base64.b64encode(buf.getvalue()).decode()
+
+                images_meta = state.get("images")
+
+                def _best_view_pos(idx):
+                    """Camera position of FARM's own best viewing frame."""
+                    row = vp_ids[idx] if idx < len(vp_ids) else None
+                    if not row or img_pos is None:
+                        return None
+                    fid = int(row[0])
+                    if not (0 <= fid < len(img_pos)) or img_pos[fid] is None:
+                        return None
+                    p = _to_np(img_pos[fid]).reshape(-1)[:3]
+                    return [round(float(v), 4) for v in p]
+
+                def _best_view_frame_b64(idx):
+                    """FULL image of FARM's best viewing frame, from the
+                    overlay's frame cache."""
+                    row = vp_ids[idx] if idx < len(vp_ids) else None
+                    if not row:
+                        return None
+                    fid = int(row[0])
+                    if not (0 <= fid < len(self._frame_jpegs)):
+                        return None
+                    raw = self._frame_jpegs[fid]
+                    if not raw:
+                        return None
+                    import base64
+                    return base64.b64encode(raw).decode()
+
+                def _best_view_pose(idx):
+                    """Full 4x4 camera pose of that frame (orientation
+                    included), from the per-frame images metadata."""
+                    row = vp_ids[idx] if idx < len(vp_ids) else None
+                    if not row or not isinstance(images_meta, list):
+                        return None
+                    fid = int(row[0])
+                    if not (0 <= fid < len(images_meta)):
+                        return None
+                    pose = getattr(images_meta[fid], "pose", None)
+                    if pose is None:
+                        return None
+                    T = _to_np(pose).reshape(4, 4)
+                    return [[round(float(v), 6) for v in r] for r in T]
+
+                cands = []
+                for oid, score, caption in list(results)[:10]:
+                    try:
+                        idx = ids.index(int(oid))
+                    except ValueError:
+                        continue
+                    cands.append({
+                        "object_id": int(oid),
+                        "score": round(float(score), 4),
+                        "caption": str(caption or ""),
+                        "pos_hab": [round(float(v), 4) for v in means[idx]],
+                        "view_pos_hab": _best_view_pos(idx),
+                        "view_pose_hab": _best_view_pose(idx),
+                        "crop_jpeg_b64": _best_crop_b64(idx),
+                        "view_frame_jpeg_b64": _best_view_frame_b64(idx),
+                    })
+                last["candidates"] = cands
             except Exception:
                 pass
             return out
@@ -164,6 +310,18 @@ class FrontierOverlay:
                 return
             n = int(last.get("n_results", 0)) if last.get("query") == query else 0
             record = {"query": query, "n_results": n, "t": time.time()}
+            if last.get("query") == query:
+                record["candidates"] = last.get("candidates", [])
+            try:
+                self._update_match_buttons(visualizer)
+            except Exception as exc:
+                LOGGER.warning("frontier overlay: match buttons failed: %s", exc)
+            if self._suppress_mirror:
+                # Auto-refresh (e.g. after object_found): update the panel
+                # only; do not write the sink or a new search would start.
+                self._suppress_mirror = False
+                LOGGER.info("frontier overlay: panel refreshed (no mirror)")
+                return
             try:
                 tmp = sink + ".tmp"
                 with open(tmp, "w") as f:
@@ -178,6 +336,43 @@ class FrontierOverlay:
         self._query_hooked = True
         LOGGER.info("frontier overlay: Query panel wired to %s", sink)
 
+        self._last_for_buttons = last
+
+    def _update_match_buttons(self, visualizer) -> None:
+        """One clickable button per top match of the last query: clicking it
+        behaves exactly like clicking the object's 3D box (highlight + stored
+        image), so the ranked list and the boxes can be cross-referenced."""
+        server = getattr(visualizer, "_server", None)
+        if server is None:
+            return
+        cands = (getattr(self, "_last_for_buttons", None) or {}).get("candidates") or []
+        if self._match_folder is not None:
+            try:
+                self._match_folder.remove()
+            except Exception:
+                pass
+            self._match_folder = None
+        if not cands:
+            return
+        # Keep strong references to the button handles (as FARM does for its
+        # 3D box handles) or their callbacks can be garbage-collected.
+        self._match_btns = []
+        with server.gui.add_folder("Query matches") as folder:
+            self._match_folder = folder
+            for c in cands[:8]:
+                label = (f"#{c['object_id']} ({c['score']:.2f}) "
+                         f"{(c['caption'] or 'uncaptioned')[:30]}")
+                btn = server.gui.add_button(label)
+                self._match_btns.append(btn)
+
+                @btn.on_click
+                def _(_, oid=int(c["object_id"])):
+                    try:
+                        LOGGER.info("frontier overlay: match button -> object %d", oid)
+                        visualizer._handle_object_click(oid)
+                    except Exception as exc:
+                        LOGGER.warning("match button click failed: %s", exc)
+
 
 def wrap_frame_iterator(src_iter, get_visualizer, query_sink_path: str | None = None):
     """Pass-through frame iterator that pops ``frontier_viz`` payloads and
@@ -189,4 +384,6 @@ def wrap_frame_iterator(src_iter, get_visualizer, query_sink_path: str | None = 
             payload = item.pop("frontier_viz", None)
             if payload is not None:
                 overlay.handle(payload, get_visualizer())
+            if item.get("rgb") is not None:
+                overlay.cache_frame(item["rgb"])
         yield item
